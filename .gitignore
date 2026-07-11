@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+
+# Large / regenerable data (raw audio, cached latents, external dataset clone)
+data/stems/
+data/latents/
+data/jamendo_audio_low/
+data/test_stems/
+mtg-jamendo-dataset/
+
+# Model checkpoints (large binaries)
+checkpoints/
+
+# Generated run artifacts
+samples/
+results/
+*.log
+*.csv
+
+# Misc scratch
+gpu_check.txt
+
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
