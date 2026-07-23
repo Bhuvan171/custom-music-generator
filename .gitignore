@@ -11,6 +11,19 @@ data/latents/
 data/jamendo_audio_low/
 data/test_stems/
 mtg-jamendo-dataset/
+# Extracted conditioning features (~1.3 GB, regenerable via extract_features.py).
+# The *_stats.json files are NOT ignored — they are small, and training cannot run without
+# them (JamendoDataset raises if feature_stats.json is missing).
+data/features/
+data/features_val/
+
+# Audio captions (~238 MB, regenerable via caption_audio.py -- expensive to regenerate, real
+# vLLM compute time, but still raw derived data, not source) and their frozen-T5 embeddings
+# (~5.9 GB, cheap/fast to regenerate from captions via compute_text_embeddings.py).
+data/captions/
+data/captions_val/
+data/text_emb/
+data/text_emb_val/
 
 # Model checkpoints (large binaries)
 checkpoints/
@@ -20,6 +33,11 @@ samples/
 results/
 *.log
 *.csv
+
+# Your own reference tracks — audio stays local. The README is kept.
+references/*
+!references/README.md
+data/tag_embeddings.npz
 
 # Misc scratch
 gpu_check.txt

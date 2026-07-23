@@ -56,7 +56,18 @@ class WaveformVAE(nn.Module):
         self.dec_proj = nn.Conv1d(lat, D, 1)
         self.dec_up   = nn.Conv1d(D, D, 3, padding=1)
         self.dec_body = nn.Sequential(*[ConvNeXt1d(D) for _ in range(N)])
-        self.dec_head = nn.Linear(D, nfft)
+
+        # Synthesis head. See config.py's VAE_DEC_USE_ISTFT_HEAD comment for the measured
+        # evidence this replaces a phase-blind head with a phase-aware one, not just a loss patch.
+        if config.VAE_DEC_USE_ISTFT_HEAD:
+            self.dec_head_mag   = nn.Linear(D, n_bins)        # magnitude per STFT bin
+            self.dec_head_phase = nn.Linear(D, n_bins * 2)    # raw (real, imag); atan2 -> phase
+        else:
+            self.dec_head = nn.Linear(D, nfft)   # legacy raw-frame + overlap-add head, kept for
+                                                  # A/B rollback (checkpoints are head-specific
+                                                  # either way; flip the flag and re-init/retrain,
+                                                  # do not attempt to load a checkpoint across
+                                                  # head types).
 
     @staticmethod
     def _stft_feat(audio, nfft, hop):
@@ -110,15 +121,54 @@ class WaveformVAE(nn.Module):
         # Remove the nfft//2 left-padding introduced in _stft_feat
         return signal[..., nfft // 2: nfft // 2 + T_out]
 
+    def _istft_synth(self, h, T_out):
+        """
+        Vocos/WaveNeXt-style synthesis: predict magnitude + phase per STFT bin per frame, then
+        torch.istft. Unlike the raw-frame + manual-overlap-add head this replaces, phase is an
+        EXPLICIT, LEARNED quantity here — the piece missing from the measured defect (52%/37%
+        energy loss at 2-6kHz/0.5-2kHz vs real, even from ground-truth latents; a band-normalized
+        loss recovered most of it but plateaued and made output measurably peakier, because a
+        loss cannot train a representation the architecture has no room for).
+
+        Magnitude via softplus (>=0, unlike exp, does not explode on a stray large logit).
+        Phase via atan2(imag_raw, real_raw) of two UNCONSTRAINED linear outputs — atan2 gives a
+        valid angle for any real input, so there's no unit-circle normalization to get wrong.
+
+        Unlike the legacy head, this does NOT need to replicate the encoder's own left-pad/center
+        STFT bookkeeping (a separate, known, deferred bug — see project_transfer.md's "encoder
+        double-pads" note, left alone here because the encoder is FROZEN and any change to its
+        input framing would shift what its already-trained weights expect). The decoder is an
+        independently trained network end-to-end from dec_proj through this head; it only needs
+        torch.istft's OWN standard, correct center=True convention to be internally consistent,
+        and will learn whatever magnitude/phase values best reconstruct the target audio through
+        THAT synthesis operator via the reconstruction losses.
+        """
+        nfft, hop = config.VAE_DEC_NFFT, config.VAE_DEC_HOP
+        mag = F.softplus(self.dec_head_mag(h))                       # (B, T, n_bins), >= 0
+        real_raw, imag_raw = self.dec_head_phase(h).chunk(2, dim=-1) # each (B, T, n_bins)
+        phase = torch.atan2(imag_raw.float(), real_raw.float())
+        real = (mag.float() * torch.cos(phase)).transpose(1, 2)      # (B, n_bins, T)
+        imag = (mag.float() * torch.sin(phase)).transpose(1, 2)
+        spec = torch.complex(real, imag)
+        win  = torch.hann_window(nfft, device=spec.device)
+        signal = torch.istft(spec, n_fft=nfft, hop_length=hop, window=win,
+                             center=True, length=T_out)
+        return signal.unsqueeze(1)   # (B, 1, T_out) -- match _overlap_add's return shape
+
     def decode(self, z):
         T_out = z.shape[-1] * config.VAE_DEC_FRAME_UP * config.VAE_DEC_HOP
-        h      = self.dec_proj(z)
-        h      = F.interpolate(h, scale_factor=config.VAE_DEC_FRAME_UP,
-                               mode='linear', align_corners=False)
-        h      = self.dec_up(h)
-        h      = self.dec_body(h)
-        frames = self.dec_head(h.transpose(1, 2))   # (B, T_frames, nfft)
-        return self._overlap_add(frames, T_out)
+        h = self.dec_proj(z)
+        h = F.interpolate(h, scale_factor=config.VAE_DEC_FRAME_UP,
+                          mode='linear', align_corners=False)
+        h = self.dec_up(h)
+        h = self.dec_body(h)
+        h = h.transpose(1, 2)   # (B, T_frames, D)
+
+        if config.VAE_DEC_USE_ISTFT_HEAD:
+            return self._istft_synth(h, T_out)
+        else:
+            frames = self.dec_head(h)   # (B, T_frames, nfft), legacy raw-frame path
+            return self._overlap_add(frames, T_out)
 
     def forward(self, x):
         mu, logvar = self.encode(x)
@@ -128,6 +178,11 @@ class WaveformVAE(nn.Module):
 
     @property
     def last_layer(self):
+        # Used by the VQGAN-style adaptive adversarial weight (src/losses.py adaptive_weight),
+        # which needs ONE tensor to take gradients w.r.t. -- the magnitude head is the layer that
+        # most directly determines reconstructed energy, the thing that loss balances against.
+        if config.VAE_DEC_USE_ISTFT_HEAD:
+            return self.dec_head_mag.weight
         return self.dec_head.weight
 
 

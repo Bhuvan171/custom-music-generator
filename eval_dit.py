@@ -34,7 +34,8 @@ from src.dataset import JamendoDataset, collate_fn
 from src.dit import MusicDiT
 from src.vae import WaveformVAE
 
-VAE_CKPT   = "checkpoints/vae/vae_step0200000.pt"
+_ft_ckpts  = sorted(glob.glob(os.path.join(config.FT_DEC_CKPT_DIR, "dec_step*.pt")))
+VAE_CKPT   = _ft_ckpts[-1] if _ft_ckpts else "checkpoints/vae/vae_step0200000.pt"
 N_CLIPS    = 6      # fixed real clips used for generation / SNR / spectrograms
 N_REF      = 300    # cached latents sampled to estimate the "real" variance reference
 SEED       = 42
@@ -81,22 +82,43 @@ latent_std  = torch.tensor(_stats["std"],  device=device).view(1, -1, 1)
 
 # ── Frozen VAE ────────────────────────────────────────────────────────────
 vae = WaveformVAE().to(device)
-vae.load_state_dict(torch.load(VAE_CKPT, map_location=device, weights_only=False)["vae"])
+_missing, _unexpected = vae.load_state_dict(
+    torch.load(VAE_CKPT, map_location=device, weights_only=False)["vae"], strict=False)
+if _missing or _unexpected:
+    print(f"  Partial VAE load from {VAE_CKPT} (head architecture differs): "
+          f"missing={_missing} unexpected={_unexpected}")
+print(f"VAE checkpoint: {VAE_CKPT}")
 vae.eval()
 vae.requires_grad_(False)
 
 # ── Fixed real clips (with tags) for generation / SNR / spectrograms ────────
-ds = JamendoDataset(config.STEMS_DIR, config.TSV_PATH, config.VOCAB_PATH)
+# deterministic_crop matches how latents/features were built, so the loaded features
+# describe exactly this audio (a random crop would misalign the chroma).
+use_feats = config.DIT_USE_GLOBAL_FEATS or config.DIT_USE_CHROMA or config.DIT_USE_TEXTURE
+ds = JamendoDataset(config.STEMS_DIR, config.TSV_PATH, config.VOCAB_PATH,
+                    deterministic_crop=True, load_features=use_feats)
 dl = DataLoader(ds, batch_size=1, shuffle=True, collate_fn=collate_fn, num_workers=2)
 torch.manual_seed(SEED)
-audio_list, tag_lists = [], []
-for clip, tags in dl:
-    if tags[0]:
-        audio_list.append(clip)
-        tag_lists.append(tags[0])
+audio_list, tag_lists, feat_list = [], [], []
+for batch in dl:
+    if use_feats:
+        clip, tags, f = batch
+        if not tags[0] or f["valid"][0] < 0.5:
+            continue
+        feat_list.append(f)
+    else:
+        clip, tags = batch
+        if not tags[0]:
+            continue
+    audio_list.append(clip)
+    tag_lists.append(tags[0])
     if len(audio_list) == N_CLIPS:
         break
 audio = torch.cat(audio_list, dim=0).to(device)
+
+feats = None
+if use_feats:
+    feats = {k: torch.cat([f[k] for f in feat_list], dim=0).to(device) for k in feat_list[0]}
 
 with torch.no_grad():
     z1, _         = vae.encode(audio)
@@ -113,13 +135,17 @@ dit = MusicDiT().to(device)
 latest_gen_audio = None
 for ckpt_path in ckpts:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    dit.load_state_dict(ckpt["ema"])
+    # strict=False: pre-chroma checkpoints have no feat_embed weights. Those stay zero-init,
+    # i.e. a no-op — so an old checkpoint evaluates exactly as it did before, and stays
+    # directly comparable to the fine-tuned ones.
+    dit.load_state_dict(ckpt["ema"], strict=False)
     dit.eval()
     step = ckpt["step"]
 
     torch.manual_seed(SEED)   # identical initial noise across checkpoints -> fair trend comparison
     with torch.no_grad():
-        z_gen     = dit.sample(tag_lists, steps=config.EULER_STEPS, cfg_scale=config.CFG_SCALE, device=device)
+        z_gen     = dit.sample(tag_lists, steps=config.EULER_STEPS, cfg_scale=config.CFG_SCALE,
+                               device=device, feats=feats)
         z_gen     = z_gen.float() * latent_std + latent_mean   # back to raw VAE latent scale
         audio_gen = vae.decode(z_gen).float()
 
@@ -214,9 +240,21 @@ plt.tight_layout()
 plt.savefig(os.path.join(run_dir, "spectrograms.png"), dpi=120); plt.close()
 
 # ── Save the audio itself for listening ──────────────────────────────────────
+def write_audio(path, x):
+    """
+    Peak-normalize only if the clip would otherwise clip. sf.write() defaults to PCM_16 for
+    .wav and HARD-CLIPS outside [-1, 1]; measured, 8 of 16 generated eval clips exceeded it
+    (peak 2.45). Hard clipping manufactures broadband distortion — it invents the very
+    noise artifact this script exists to measure.
+    """
+    x = x.cpu().numpy()
+    peak = float(abs(x).max())
+    sf.write(path, x / peak if peak > 1.0 else x, config.SAMPLE_RATE)
+
+
 for i in range(N_CLIPS):
-    sf.write(os.path.join(run_dir, f"clip{i}_real.wav"), audio[i, 0].cpu().numpy(), config.SAMPLE_RATE)
-    sf.write(os.path.join(run_dir, f"clip{i}_vae_recon.wav"), audio_vae_rec[i, 0].cpu().numpy(), config.SAMPLE_RATE)
-    sf.write(os.path.join(run_dir, f"clip{i}_dit_gen.wav"), latest_gen_audio[i, 0].cpu().numpy(), config.SAMPLE_RATE)
+    write_audio(os.path.join(run_dir, f"clip{i}_real.wav"), audio[i, 0])
+    write_audio(os.path.join(run_dir, f"clip{i}_vae_recon.wav"), audio_vae_rec[i, 0])
+    write_audio(os.path.join(run_dir, f"clip{i}_dit_gen.wav"), latest_gen_audio[i, 0])
 
 print(f"\nSaved metrics, plots, and audio to {run_dir}")
